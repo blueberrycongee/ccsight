@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# ccsight — render an image inline in your terminal, even when wrapped by an
+#           agentic CLI (Claude Code, Cursor, Aider) that sanitizes ESC bytes
+#           on its captured stdout.
+#
+# The trick: don't write to the wrapping CLI's stdout. Find the controlling
+# pty of the wrapper (or this shell), and write the sixel sequence there
+# directly. Pad with newlines after so the image scrolls into the terminal's
+# scrollback, where the wrapper can never repaint over it. To view: scroll up.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+ccsight — inline image rendering for agentic CLI terminals (Claude Code, etc.)
+
+USAGE
+  ccsight <image.png> [options]
+
+OPTIONS
+  --width    N    target image width in pixels (default: 1280)
+  --colors   N    palette size, 8..256 (default: 128)
+  --padding  N    blank lines after image to push into scrollback (default: 80)
+  --pts     DEV   override target pty. Bypasses auto-detection.
+  --quiet         do not print the post-render hint
+  --help, -h      this help
+
+ENVIRONMENT
+  CCSIGHT_PTS     fallback pty path if auto-detection fails
+
+REQUIREMENTS
+  • python3 with Pillow (PIL)
+  • a sixel-capable terminal (xterm with --enable-sixel-graphics, mlterm,
+    foot, wezterm, contour, ...). iTerm2 / Kitty are not yet supported.
+
+EXIT CODES
+  0  success    1  runtime error    2  bad usage
+EOF
+}
+
+# --- arg parse ---
+PNG=""
+WIDTH=1280
+COLORS=128
+PADDING=80
+PTS=""
+QUIET=0
+
+while (($#)); do
+  case $1 in
+    --width)    WIDTH=$2;   shift 2;;
+    --colors)   COLORS=$2;  shift 2;;
+    --padding)  PADDING=$2; shift 2;;
+    --pts)      PTS=$2;     shift 2;;
+    --quiet)    QUIET=1;    shift;;
+    --help|-h)  usage; exit 0;;
+    -*)         echo "ccsight: unknown flag: $1" >&2; exit 2;;
+    *)
+      if [[ -z "$PNG" ]]; then
+        PNG=$1
+      else
+        echo "ccsight: unexpected argument: $1" >&2
+        exit 2
+      fi
+      shift;;
+  esac
+done
+
+[[ -z "$PNG" ]] && { usage >&2; exit 2; }
+[[ ! -f "$PNG" ]] && { echo "ccsight: not a file: $PNG" >&2; exit 1; }
+
+# --- locate the encoder relative to this script (resolve symlinks) ---
+SELF=$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")
+DIR=$(cd "$(dirname "$SELF")" && pwd)
+ENCODER="$DIR/lib/png2sixel.py"
+[[ ! -f "$ENCODER" ]] && { echo "ccsight: encoder missing at $ENCODER" >&2; exit 1; }
+
+# --- choose target pty ---
+# Priority: --pts arg > $CCSIGHT_PTS > /dev/tty > parent-process-tree probe.
+if [[ -z "$PTS" ]]; then
+  PTS=${CCSIGHT_PTS:-}
+fi
+if [[ -z "$PTS" ]]; then
+  if { : > /dev/tty; } 2>/dev/null; then
+    PTS=/dev/tty
+  fi
+fi
+if [[ -z "$PTS" ]]; then
+  pid=$$
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    parent=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
+    [[ -z "$parent" || "$parent" -le 1 ]] && break
+    cmd=$(ps -p "$parent" -o comm= 2>/dev/null | tr -d ' ' || true)
+    tty=$(ps -p "$parent" -o tty= 2>/dev/null | tr -d ' ' || true)
+    if [[ "$cmd" == claude* || "$cmd" == cursor* || "$cmd" == aider* ]] \
+       && [[ -n "$tty" && "$tty" != "?" ]]; then
+      PTS="/dev/$tty"
+      break
+    fi
+    pid=$parent
+  done
+fi
+
+[[ -z "$PTS" ]] && { echo "ccsight: could not detect a target pty (try --pts /dev/pts/N or set CCSIGHT_PTS)" >&2; exit 1; }
+[[ ! -w "$PTS" ]] && { echo "ccsight: cannot write to $PTS (permissions / wrong session)" >&2; exit 1; }
+
+# --- encode + inject ---
+TMP=$(mktemp -t ccsight.XXXXXX)
+trap 'rm -f "$TMP"' EXIT
+
+python3 "$ENCODER" "$PNG" "$WIDTH" "$COLORS" > "$TMP"
+
+{
+  cat "$TMP"
+  printf '%.0s\n' $(seq 1 "$PADDING")
+  if [[ "$QUIET" -eq 0 ]]; then
+    printf '[ccsight: image above — scroll up to view a clean copy]\n'
+  fi
+} > "$PTS"
+
+if [[ "$QUIET" -eq 0 ]]; then
+  echo "ccsight: sent $(wc -c <"$TMP") bytes of sixel to $PTS"
+fi
