@@ -54,6 +54,11 @@ OPTIONS
                   always fits in one viewport / one PageUp shows it all.
                   Pass 0 to disable (image renders at native size; very
                   tall images then need multiple scrolls).
+  --protocol P    image protocol. P ∈ {auto, sixel, iterm2}.
+                  Default: auto (TERM_PROGRAM = iTerm.app/WezTerm/ghostty
+                  → iterm2; otherwise sixel).
+                  iterm2 is faster (skips quantize) and supports more
+                  colors, but only works on iTerm2/WezTerm/Ghostty.
   --pts     DEV   override target pty. Bypasses auto-detection.
   --quiet         do not print the post-render hint
   --help, -h      this help
@@ -137,6 +142,24 @@ probe_cell_h_via_dsr() {
     fi
   fi
   return 1
+}
+
+# Pick an image protocol based on the host terminal. iTerm2-family
+# terminals advertise themselves via TERM_PROGRAM (iTerm2 sets
+# "iTerm.app", WezTerm "WezTerm", Ghostty "ghostty"). Returns the
+# protocol name to stdout.
+detect_protocol() {
+  case "${TERM_PROGRAM:-}" in
+    iTerm.app|iTerm2.app)  echo iterm2; return;;
+    WezTerm)               echo iterm2; return;;
+    ghostty)               echo iterm2; return;;
+  esac
+  if [[ -n "${LC_TERMINAL:-}" ]]; then
+    case "$LC_TERMINAL" in
+      iTerm2)              echo iterm2; return;;
+    esac
+  fi
+  echo sixel
 }
 
 read_config_value() {
@@ -264,6 +287,7 @@ PTS=""
 QUIET=0
 CELL_H_OVERRIDE=""   # empty = run resolve_cell_h
 MAX_H_PX=""          # empty = auto = term_rows × cell_h. 0 disables.
+PROTOCOL=""          # empty = auto-detect from TERM_PROGRAM
 
 while (($#)); do
   case $1 in
@@ -272,6 +296,7 @@ while (($#)); do
     --padding)  PADDING=$2;          shift 2;;
     --cell-h)   CELL_H_OVERRIDE=$2;  shift 2;;
     --max-h)    MAX_H_PX=$2;         shift 2;;
+    --protocol) PROTOCOL=$2;         shift 2;;
     --pts)      PTS=$2;              shift 2;;
     --quiet)    QUIET=1;             shift;;
     --help|-h)  usage; exit 0;;
@@ -279,6 +304,14 @@ while (($#)); do
     *)          PNGS+=("$1");        shift;;
   esac
 done
+
+# Resolve protocol. CCSIGHT_PROTOCOL env can override; --protocol flag wins.
+[[ -z "$PROTOCOL" ]] && PROTOCOL=${CCSIGHT_PROTOCOL:-}
+[[ -z "$PROTOCOL" || "$PROTOCOL" == "auto" ]] && PROTOCOL=$(detect_protocol)
+case "$PROTOCOL" in
+  sixel|iterm2) ;;
+  *) echo "ccsight: unknown protocol '$PROTOCOL' (expected: auto, sixel, iterm2)" >&2; exit 2;;
+esac
 
 (( ${#PNGS[@]} == 0 )) && { usage >&2; exit 2; }
 for p in "${PNGS[@]}"; do
@@ -341,21 +374,52 @@ if [[ -z "$MAX_H_PX" ]]; then
 fi
 
 # --- encode each image ---
-# The encoder writes "WIDTH=...\nHEIGHT=..." to stderr after the resize +
-# quantize so we can size padding to the actual rendered total height,
-# not to a worst-case constant.
+# Sixel path: png2sixel.py quantizes + emits sixel, reports rendered
+#             dimensions on stderr.
+# iTerm2 path: imgmeta.py computes display size; we ship the original
+#             bytes base64-wrapped in OSC 1337 (no quantize, faster).
+META_SCRIPT="$DIR/lib/imgmeta.py"
 WORK=$(mktemp -d -t ccsight.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
 declare -i TOTAL_H_PX=0
-declare -a SIXEL_FILES=()
+declare -a PAYLOAD_FILES=()
 declare -a HEIGHTS=()
 
-for png in "${PNGS[@]}"; do
-  idx=${#SIXEL_FILES[@]}
-  sixel="$WORK/$idx.sixel"
+for img in "${PNGS[@]}"; do
+  idx=${#PAYLOAD_FILES[@]}
+  payload="$WORK/$idx.payload"
   meta="$WORK/$idx.meta"
-  python3 "$ENCODER" "$png" "$WIDTH" "$COLORS" "$MAX_H_PX" > "$sixel" 2> "$meta"
+
+  case "$PROTOCOL" in
+    sixel)
+      python3 "$ENCODER" "$img" "$WIDTH" "$COLORS" "$MAX_H_PX" > "$payload" 2> "$meta"
+      ;;
+    iterm2)
+      # imgmeta gives us display W/H after the same scaling clamps
+      # png2sixel would apply, so padding stays consistent across
+      # protocols.
+      python3 "$META_SCRIPT" "$img" "$WIDTH" "$MAX_H_PX" > "$meta"
+      disp_w=""
+      disp_h=""
+      while IFS='=' read -r k v; do
+        [[ "$k" == WIDTH  ]] && disp_w=$v
+        [[ "$k" == HEIGHT ]] && disp_h=$v
+      done < "$meta"
+      # Build OSC 1337. Tell iTerm2 the display dimensions in pixels;
+      # it scales the original bytes for us.
+      {
+        printf '\e]1337;File=inline=1;preserveAspectRatio=1;width=%spx;height=%spx:' \
+          "${disp_w:-100}" "${disp_h:-100}"
+        base64 -w0 < "$img"
+        printf '\a'
+      } > "$payload"
+      # Encoder-style metadata so the rest of the script reads HEIGHT
+      # the same way regardless of protocol.
+      printf 'WIDTH=%s\nHEIGHT=%s\n' "$disp_w" "$disp_h" >> "$meta"
+      ;;
+  esac
+
   h=""
   while IFS='=' read -r key value; do
     [[ "$key" == "HEIGHT" ]] && h=$value
@@ -364,7 +428,7 @@ for png in "${PNGS[@]}"; do
     TOTAL_H_PX=$(( TOTAL_H_PX + h ))
   fi
   HEIGHTS+=("${h:-?}")
-  SIXEL_FILES+=("$sixel")
+  PAYLOAD_FILES+=("$payload")
 done
 
 # --- auto-pad based on combined stack height ---
@@ -389,8 +453,8 @@ fi
 # tool result" row between each call, repainting onto the just-rendered
 # image and corrupting it. Stacking inside one write avoids that.
 {
-  for sixel in "${SIXEL_FILES[@]}"; do
-    cat "$sixel"
+  for payload in "${PAYLOAD_FILES[@]}"; do
+    cat "$payload"
   done
   printf '%.0s\n' $(seq 1 "$PADDING")
   if [[ "$QUIET" -eq 0 ]]; then
@@ -400,9 +464,9 @@ fi
 
 if [[ "$QUIET" -eq 0 ]]; then
   total_bytes=0
-  for sixel in "${SIXEL_FILES[@]}"; do
-    total_bytes=$(( total_bytes + $(wc -c < "$sixel") ))
+  for payload in "${PAYLOAD_FILES[@]}"; do
+    total_bytes=$(( total_bytes + $(wc -c < "$payload") ))
   done
   heights_csv=$(IFS=,; echo "${HEIGHTS[*]}")
-  echo "ccsight: ${#PNGS[@]} image(s), $total_bytes bytes to $PTS (cell_h=${CELL_H_PX}px, heights=${heights_csv}px, padding=${PADDING} rows)"
+  echo "ccsight: ${#PNGS[@]} image(s), $total_bytes bytes via $PROTOCOL to $PTS (cell_h=${CELL_H_PX}px, heights=${heights_csv}px, padding=${PADDING} rows)"
 fi
