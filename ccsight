@@ -18,6 +18,7 @@ set -euo pipefail
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ccsight"
 CONFIG_FILE="$CONFIG_DIR/config"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ccsight"
 
 usage() {
   cat <<'EOF'
@@ -63,6 +64,7 @@ OPTIONS
                   iterm2/kitty are faster (skip quantize) and full
                   color, but each only works on its native terminal.
   --pts     DEV   override target pty. Bypasses auto-detection.
+  --no-cache      skip the encoded-payload cache (~/.cache/ccsight)
   --quiet         do not print the post-render hint
   --help, -h      this help
 
@@ -295,6 +297,7 @@ QUIET=0
 CELL_H_OVERRIDE=""   # empty = run resolve_cell_h
 MAX_H_PX=""          # empty = auto = term_rows × cell_h. 0 disables.
 PROTOCOL=""          # empty = auto-detect from TERM_PROGRAM
+NO_CACHE=0
 
 while (($#)); do
   case $1 in
@@ -305,6 +308,7 @@ while (($#)); do
     --max-h)    MAX_H_PX=$2;         shift 2;;
     --protocol) PROTOCOL=$2;         shift 2;;
     --pts)      PTS=$2;              shift 2;;
+    --no-cache) NO_CACHE=1;          shift;;
     --quiet)    QUIET=1;             shift;;
     --help|-h)  usage; exit 0;;
     -*)         echo "ccsight: unknown flag: $1" >&2; exit 2;;
@@ -390,13 +394,51 @@ WORK=$(mktemp -d -t ccsight.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
 declare -i TOTAL_H_PX=0
+declare -i CACHE_HITS=0
 declare -a PAYLOAD_FILES=()
 declare -a HEIGHTS=()
+
+# Cache key = sha256(file_content + protocol + clamps). File content
+# hashing means the cache invalidates automatically when the source
+# image bytes change — no mtime tracking needed. Different protocols
+# produce different payloads so they live under separate keys.
+compute_cache_key() {
+  local file=$1 proto=$2 w=$3 c=$4 mh=$5
+  {
+    sha256sum "$file" | awk '{print $1}'
+    echo "p=$proto w=$w c=$c mh=$mh"
+  } | sha256sum | awk '{print $1}'
+}
 
 for img in "${PNGS[@]}"; do
   idx=${#PAYLOAD_FILES[@]}
   payload="$WORK/$idx.payload"
   meta="$WORK/$idx.meta"
+
+  # Cache lookup. The encoded payload depends on (image bytes, protocol,
+  # width, colors, max-h) — exactly the inputs to the encoding step.
+  cache_payload=""
+  cache_meta=""
+  if (( ! NO_CACHE )); then
+    key=$(compute_cache_key "$img" "$PROTOCOL" "$WIDTH" "$COLORS" "$MAX_H_PX")
+    cache_payload="$CACHE_DIR/$key.payload"
+    cache_meta="$CACHE_DIR/$key.meta"
+    if [[ -f "$cache_payload" && -f "$cache_meta" ]]; then
+      cp "$cache_payload" "$payload"
+      cp "$cache_meta" "$meta"
+      h=""
+      while IFS='=' read -r key value; do
+        [[ "$key" == "HEIGHT" ]] && h=$value
+      done < "$meta"
+      if [[ "$h" =~ ^[0-9]+$ ]]; then
+        TOTAL_H_PX=$(( TOTAL_H_PX + h ))
+      fi
+      HEIGHTS+=("${h:-?}")
+      PAYLOAD_FILES+=("$payload")
+      CACHE_HITS=$(( CACHE_HITS + 1 ))
+      continue
+    fi
+  fi
 
   case "$PROTOCOL" in
     sixel)
@@ -473,6 +515,15 @@ PY
   fi
   HEIGHTS+=("${h:-?}")
   PAYLOAD_FILES+=("$payload")
+
+  # Write to cache. Best-effort — if the cache dir isn't writable for
+  # any reason, skip silently and let the next run re-encode.
+  if (( ! NO_CACHE )) && [[ -n "$cache_payload" ]]; then
+    mkdir -p "$CACHE_DIR" 2>/dev/null && {
+      cp "$payload" "$cache_payload" 2>/dev/null || true
+      cp "$meta"    "$cache_meta"    2>/dev/null || true
+    }
+  fi
 done
 
 # --- auto-pad based on combined stack height ---
@@ -512,5 +563,9 @@ if [[ "$QUIET" -eq 0 ]]; then
     total_bytes=$(( total_bytes + $(wc -c < "$payload") ))
   done
   heights_csv=$(IFS=,; echo "${HEIGHTS[*]}")
-  echo "ccsight: ${#PNGS[@]} image(s), $total_bytes bytes via $PROTOCOL to $PTS (cell_h=${CELL_H_PX}px, heights=${heights_csv}px, padding=${PADDING} rows)"
+  cache_note=""
+  if (( CACHE_HITS > 0 )); then
+    cache_note=", cache=${CACHE_HITS}/${#PNGS[@]}"
+  fi
+  echo "ccsight: ${#PNGS[@]} image(s), $total_bytes bytes via $PROTOCOL to $PTS (cell_h=${CELL_H_PX}px, heights=${heights_csv}px, padding=${PADDING} rows${cache_note})"
 fi
