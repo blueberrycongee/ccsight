@@ -7,6 +7,13 @@
 # pty of the wrapper (or this shell), and write the sixel sequence there
 # directly. Pad with newlines after so the image scrolls into the terminal's
 # scrollback, where the wrapper can never repaint over it. To view: scroll up.
+#
+# Why we have to push into scrollback: Claude-Code-style TUIs maintain an
+# internal model of "this chat-flow row should show that text" and use
+# absolute cursor positioning (`\e[<row>;<col>H`) to repaint. Any image
+# cell still in the viewport is at risk of being overwritten by the
+# wrapper's next chat-row repaint. Scrollback is the only region the
+# wrapper never targets, so anything that wants to survive must live there.
 set -euo pipefail
 
 usage() {
@@ -21,13 +28,20 @@ OPTIONS
                   (default: auto = terminal cols × 8 px / fits viewport)
   --colors   N    palette size, 8..256 (default: 128)
   --padding  N    blank lines after image to push into scrollback
-                  (default: auto = terminal rows from stty)
+                  (default: auto = ceil(image_h / cell_h) + 4 margin,
+                   capped to terminal rows; smaller images get less push,
+                   so less PageUp to find them)
+  --cell-h   N    cell height in pixels for the auto-padding calculation.
+                  Default: 16 (typical xterm 14..18 px). On HiDPI / large
+                  fonts this is too small and over-pads; pass --cell-h 24
+                  or so to tighten.
   --pts     DEV   override target pty. Bypasses auto-detection.
   --quiet         do not print the post-render hint
   --help, -h      this help
 
 ENVIRONMENT
   CCSIGHT_PTS     fallback pty path if auto-detection fails
+  CCSIGHT_CELL_H  default cell height for auto-padding
 
 REQUIREMENTS
   • python3 with Pillow (PIL)
@@ -43,17 +57,19 @@ EOF
 PNG=""
 WIDTH=""             # empty = auto-size from terminal cols
 COLORS=128
-PADDING=""           # empty = auto-size from terminal rows
+PADDING=""           # empty = auto-size from image_height / cell_h
 PTS=""
 QUIET=0
+CELL_H_PX=${CCSIGHT_CELL_H:-16}
 
 while (($#)); do
   case $1 in
-    --width)    WIDTH=$2;   shift 2;;
-    --colors)   COLORS=$2;  shift 2;;
-    --padding)  PADDING=$2; shift 2;;
-    --pts)      PTS=$2;     shift 2;;
-    --quiet)    QUIET=1;    shift;;
+    --width)    WIDTH=$2;       shift 2;;
+    --colors)   COLORS=$2;      shift 2;;
+    --padding)  PADDING=$2;     shift 2;;
+    --cell-h)   CELL_H_PX=$2;   shift 2;;
+    --pts)      PTS=$2;         shift 2;;
+    --quiet)    QUIET=1;        shift;;
     --help|-h)  usage; exit 0;;
     -*)         echo "ccsight: unknown flag: $1" >&2; exit 2;;
     *)
@@ -105,13 +121,7 @@ fi
 [[ -z "$PTS" ]] && { echo "ccsight: could not detect a target pty (try --pts /dev/pts/N or set CCSIGHT_PTS)" >&2; exit 1; }
 [[ ! -w "$PTS" ]] && { echo "ccsight: cannot write to $PTS (permissions / wrong session)" >&2; exit 1; }
 
-# --- size-aware width + padding ---
-# Both default off the target pty's window size:
-#   • width = cols × 8 px       (xterm renders sixel at native pixel scale; if
-#                                 image_px > viewport_px the right edge clips,
-#                                 so anchor the encoder to columns × cell_w)
-#   • padding = rows            (one screenful of newlines pushes the image
-#                                 cleanly into scrollback)
+# --- size-aware width ---
 # `stty size < $PTS` is an ioctl (TIOCGWINSZ) — it reads window size from the
 # pty driver, NOT keystrokes, so it doesn't compete with the wrapper's input
 # read.
@@ -133,16 +143,42 @@ fi
 if [[ -z "$WIDTH" ]]; then
   WIDTH=$(( term_cols * CELL_W_PX ))
 fi
+
+# --- encode ---
+# The encoder writes "WIDTH=...\nHEIGHT=..." to stderr after the resize +
+# quantize so we can size padding to the actual rendered image, not to a
+# worst-case constant. stdout still carries the sixel bytes.
+TMP=$(mktemp -t ccsight.XXXXXX)
+META=$(mktemp -t ccsight-meta.XXXXXX)
+trap 'rm -f "$TMP" "$META"' EXIT
+
+python3 "$ENCODER" "$PNG" "$WIDTH" "$COLORS" > "$TMP" 2> "$META"
+
+img_height_px=""
+while IFS='=' read -r key value; do
+  case $key in
+    HEIGHT) img_height_px=$value;;
+  esac
+done < "$META"
+
+# --- auto-pad based on actual image rows ---
+# Padding goal: push the image just past the viewport top, into scrollback.
+# Minimum safe padding ≈ image height (in rows) + small margin for cursor
+# offset. We don't know the wrapper's cursor row at render time, so margin
+# absorbs the slack. Cap at term_rows so we never overshoot a full page —
+# image already in scrollback after term_rows of scroll regardless.
 if [[ -z "$PADDING" ]]; then
-  PADDING=$term_rows
+  if [[ "$img_height_px" =~ ^[0-9]+$ ]] && (( CELL_H_PX > 0 )); then
+    img_rows=$(( (img_height_px + CELL_H_PX - 1) / CELL_H_PX ))   # ceil
+    PADDING=$(( img_rows + 4 ))
+    (( PADDING > term_rows )) && PADDING=$term_rows
+    (( PADDING < 4 ))         && PADDING=4
+  else
+    PADDING=$term_rows
+  fi
 fi
 
-# --- encode + inject ---
-TMP=$(mktemp -t ccsight.XXXXXX)
-trap 'rm -f "$TMP"' EXIT
-
-python3 "$ENCODER" "$PNG" "$WIDTH" "$COLORS" > "$TMP"
-
+# --- inject ---
 {
   cat "$TMP"
   printf '%.0s\n' $(seq 1 "$PADDING")
@@ -152,5 +188,5 @@ python3 "$ENCODER" "$PNG" "$WIDTH" "$COLORS" > "$TMP"
 } > "$PTS"
 
 if [[ "$QUIET" -eq 0 ]]; then
-  echo "ccsight: sent $(wc -c <"$TMP") bytes to $PTS (width=${WIDTH}px, padding=${PADDING} rows)"
+  echo "ccsight: sent $(wc -c <"$TMP") bytes to $PTS (width=${WIDTH}px, height≈${img_height_px:-?}px, padding=${PADDING} rows)"
 fi

@@ -15,7 +15,17 @@ import sys
 from PIL import Image
 
 
-def png_to_sixel(path: str, max_width: int = 1280, max_colors: int = 128) -> str:
+def png_to_sixel(
+    path: str,
+    max_width: int = 1280,
+    max_colors: int = 128,
+) -> tuple[str, int, int]:
+    """Encode `path` as a sixel string.
+
+    Returns (sixel_payload, rendered_width_px, rendered_height_px). Callers
+    use the post-resize height to decide how aggressively to scroll the
+    image into scrollback after the wrapper's TUI lands its next repaint.
+    """
     img = Image.open(path).convert("RGB")
     if img.width > max_width:
         new_h = int(img.height * max_width / img.width)
@@ -81,20 +91,24 @@ def png_to_sixel(path: str, max_width: int = 1280, max_colors: int = 128) -> str
         out.append("-")
 
     out.append("\x1b\\")
-    return "".join(out)
+    return "".join(out), width, height
 
 
 def main() -> int:
     if len(sys.argv) < 2 or sys.argv[1] in {"-h", "--help"}:
         print(
-            "usage: png2sixel.py <png_path> [max_width=1280] [max_colors=128]",
+            "usage: png2sixel.py <png> [max_width=1280] [max_colors=128]",
             file=sys.stderr,
         )
         return 0 if len(sys.argv) >= 2 else 2
     path = sys.argv[1]
     max_width = int(sys.argv[2]) if len(sys.argv) > 2 else 1280
     max_colors = int(sys.argv[3]) if len(sys.argv) > 3 else 128
-    sys.stdout.write(png_to_sixel(path, max_width, max_colors))
+    payload, w, h = png_to_sixel(path, max_width, max_colors)
+    sys.stdout.write(payload)
+    # Stderr metadata so the bash wrapper can size auto-padding to the
+    # actual rendered image, not a worst-case constant.
+    sys.stderr.write(f"WIDTH={w}\nHEIGHT={h}\n")
     return 0
 
 

@@ -53,10 +53,11 @@ printf '\eP0;0;0q#0;2;100;0;0#0!10~-\e\\\n'
 ## Usage
 
 ```
-ccsight <image.png>                    # inline render at 1280px / 128 colors
+ccsight <image.png>                    # inline render — width and padding auto-fit
 ccsight foo.png --width 800            # smaller
 ccsight foo.png --colors 64            # tighter palette, smaller payload
 ccsight foo.png --padding 200          # push deeper into scrollback
+ccsight foo.png --cell-h 24            # see "Calibration" — sets padding tightness
 ccsight foo.png --pts /dev/pts/3       # explicit target if auto-detect misses
 ccsight foo.png --quiet                # skip the trailing hint line
 ```
@@ -65,6 +66,41 @@ After running, **scroll up** in your terminal — the clean image is sitting
 in the scrollback. Your agentic CLI's UI may briefly look weird (input
 prompt pushed off-screen). Press any key, the wrapper redraws, normal again.
 
+## Calibration: how much to scroll back
+
+ccsight auto-sizes padding to match the rendered image's actual height,
+so smaller images don't push you a full screen up. The calculation needs
+to know how tall a single character cell is in pixels — the conversion
+factor between "image pixels emitted" and "terminal rows scrolled."
+
+The default is **16 px / cell**, which matches typical xterm at default
+font size. If your terminal uses a larger font (HiDPI / 12pt monospace
+on a Retina display), each cell is taller — say 24..50 px — and the
+default over-pads. Symptom: you scroll way more than needed to find a
+small image.
+
+To calibrate, eyeball your image once: roughly how many character rows
+does it occupy in the terminal? Then:
+
+```
+cell-h ≈ image_height_px / image_rows_visible
+```
+
+For example, a 680 px image that visually spans ~13 rows → cell-h ≈ 52.
+Pin it via:
+
+```bash
+# one-shot
+ccsight foo.png --cell-h 50
+
+# persistent (add to ~/.bashrc / ~/.zshrc)
+export CCSIGHT_CELL_H=50
+```
+
+When in doubt, leave the default — over-padding is harmless (image is
+deeper in scrollback, but still clean). Under-padding risks the
+wrapper's chat-flow repaint clipping rows of the image, which IS bad.
+
 ## How it actually works
 
 1. **Find the target pty.** Tries `--pts`, then `$CCSIGHT_PTS`, then
@@ -72,10 +108,20 @@ prompt pushed off-screen). Press any key, the wrapper redraws, normal again.
    named `claude*` / `cursor*` / `aider*` and reads its `tty=` field.
 2. **Encode the PNG to sixel.** Pure-Python with Pillow — no `chafa`,
    no `libsixel`, no ImageMagick. Quantizes to N colors, emits one band
-   per 6 pixel rows in the standard sixel DCS form.
+   per 6 pixel rows in the standard sixel DCS form. Auto-resizes to
+   `cols × 8 px` so the image fits the viewport horizontally; reports
+   the post-resize pixel size on stderr so the wrapper knows how much
+   padding to add.
 3. **Inject + flush to scrollback.** `cat sixel > /dev/pts/N`, then
-   `--padding` blank lines after to scroll the image past the wrapper's
-   redraw region.
+   `ceil(image_h / cell_h) + 4` blank lines after to scroll the image
+   past the wrapper's redraw region. Capped at `terminal_rows` so we
+   never overshoot a full page.
+
+Why scrollback specifically: Claude-Code-style TUIs maintain an internal
+"this chat-flow row should show that text" model and use absolute cursor
+positioning (`\e[<row>;<col>H`) to repaint. Anything still in the
+viewport will eventually be overwritten. Scrollback is the only region
+the wrapper never targets.
 
 The wrapper's `stdout` capture only sees `ccsight: sent N bytes` — the
 useful payload was sent on a side channel.
