@@ -45,6 +45,9 @@ Requires `python3 + Pillow` and a sixel-capable terminal:
   later)
 - ❌ macOS Terminal.app, gnome-terminal (no sixel)
 
+Input: any format Pillow can open — PNG, JPEG, GIF (first frame), WebP,
+BMP, TIFF.
+
 Quick sixel sniff: paste this into your terminal, expect a small red bar:
 ```bash
 printf '\eP0;0;0q#0;2;100;0;0#0!10~-\e\\\n'

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Pure-PIL PNG -> sixel encoder.
+# Pure-PIL image -> sixel encoder. Accepts any format Pillow can open
+# (PNG, JPEG, GIF, WebP, BMP, TIFF, …).
 #
 # Sixel format primer:
 #   DCS q                     start
@@ -12,7 +13,19 @@
 #   -                         line feed (advance 6 px down)
 #   ST  ESC backslash         end
 import sys
-from PIL import Image
+
+try:
+    from PIL import Image
+except ImportError:
+    sys.stderr.write(
+        "png2sixel: Pillow (PIL) is not installed.\n"
+        "  Install it with one of:\n"
+        "    python3 -m pip install --user Pillow\n"
+        "    sudo apt install python3-pil       # Debian/Ubuntu\n"
+        "    sudo dnf install python3-pillow    # Fedora\n"
+        "    brew install python-pillow         # macOS\n"
+    )
+    sys.exit(2)
 
 
 def png_to_sixel(
@@ -30,7 +43,12 @@ def png_to_sixel(
     `max_width` and `max_height` are aspect-preserving ceilings — both can
     be set independently. 0 means no limit on that axis.
     """
-    img = Image.open(path).convert("RGB")
+    try:
+        img = Image.open(path)
+    except Exception as exc:
+        sys.stderr.write(f"png2sixel: cannot open '{path}': {exc}\n")
+        sys.exit(1)
+    img = img.convert("RGB")
     if img.width > max_width:
         new_h = int(img.height * max_width / img.width)
         img = img.resize((max_width, new_h), Image.LANCZOS)

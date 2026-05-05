@@ -24,8 +24,11 @@ usage() {
 ccsight — inline image rendering for agentic CLI terminals (Claude Code, etc.)
 
 USAGE
-  ccsight <image.png> [more.png ...] [options]
+  ccsight <image> [more...] [options]
+  ccsight shots/*.png             # globbing works — bash expands first
   ccsight calibrate
+
+  Accepts any format Pillow can open: PNG, JPEG, GIF, WebP, BMP, TIFF.
 
   Multiple paths stack vertically with a single trailing padding sized to
   the combined stack height. Stacking happens INSIDE one subprocess so
@@ -318,6 +321,16 @@ fi
 
 # --- resolve cell_h (flag > env > config > 16; no auto-probe in main flow) ---
 CELL_H_PX=$(resolve_cell_h "$CELL_H_OVERRIDE")
+
+# First-run hint: if we fell through the entire chain to the default 16
+# AND there's nothing in the config file yet, the user probably hasn't
+# heard of `calibrate` — let them know once. Suppressed by --quiet.
+if (( ! QUIET )) \
+   && [[ -z "$CELL_H_OVERRIDE" ]] \
+   && [[ -z "${CCSIGHT_CELL_H:-}" ]] \
+   && [[ ! -f "$CONFIG_FILE" ]]; then
+  echo "ccsight: tip — run \`ccsight calibrate\` (in a bare shell) to detect your terminal's actual cell_h. Default 16 over-pads on HiDPI fonts." >&2
+fi
 
 # --- per-image vertical fit ---
 # Default: each image capped at one viewport tall (term_rows × cell_h) so a
