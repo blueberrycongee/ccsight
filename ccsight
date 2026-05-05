@@ -17,9 +17,11 @@ USAGE
   ccsight <image.png> [options]
 
 OPTIONS
-  --width    N    target image width in pixels (default: 1280)
+  --width    N    target image width in pixels
+                  (default: auto = terminal cols × 8 px / fits viewport)
   --colors   N    palette size, 8..256 (default: 128)
-  --padding  N    blank lines after image to push into scrollback (default: 80)
+  --padding  N    blank lines after image to push into scrollback
+                  (default: auto = terminal rows from stty)
   --pts     DEV   override target pty. Bypasses auto-detection.
   --quiet         do not print the post-render hint
   --help, -h      this help
@@ -39,9 +41,9 @@ EOF
 
 # --- arg parse ---
 PNG=""
-WIDTH=1280
+WIDTH=""             # empty = auto-size from terminal cols
 COLORS=128
-PADDING=80
+PADDING=""           # empty = auto-size from terminal rows
 PTS=""
 QUIET=0
 
@@ -103,6 +105,38 @@ fi
 [[ -z "$PTS" ]] && { echo "ccsight: could not detect a target pty (try --pts /dev/pts/N or set CCSIGHT_PTS)" >&2; exit 1; }
 [[ ! -w "$PTS" ]] && { echo "ccsight: cannot write to $PTS (permissions / wrong session)" >&2; exit 1; }
 
+# --- size-aware width + padding ---
+# Both default off the target pty's window size:
+#   • width = cols × 8 px       (xterm renders sixel at native pixel scale; if
+#                                 image_px > viewport_px the right edge clips,
+#                                 so anchor the encoder to columns × cell_w)
+#   • padding = rows            (one screenful of newlines pushes the image
+#                                 cleanly into scrollback)
+# `stty size < $PTS` is an ioctl (TIOCGWINSZ) — it reads window size from the
+# pty driver, NOT keystrokes, so it doesn't compete with the wrapper's input
+# read.
+ROWS_FALLBACK=40
+COLS_FALLBACK=120
+CELL_W_PX=8           # xterm default font cell ≈ 7..9 px wide; 8 fits cleanly
+
+term_rows=""
+term_cols=""
+if size=$(stty size < "$PTS" 2>/dev/null); then
+  term_rows=${size% *}
+  term_cols=${size#* }
+fi
+[[ "$term_rows" =~ ^[0-9]+$ ]] || term_rows=$ROWS_FALLBACK
+[[ "$term_cols" =~ ^[0-9]+$ ]] || term_cols=$COLS_FALLBACK
+(( term_rows >= 8 ))  || term_rows=$ROWS_FALLBACK
+(( term_cols >= 20 )) || term_cols=$COLS_FALLBACK
+
+if [[ -z "$WIDTH" ]]; then
+  WIDTH=$(( term_cols * CELL_W_PX ))
+fi
+if [[ -z "$PADDING" ]]; then
+  PADDING=$term_rows
+fi
+
 # --- encode + inject ---
 TMP=$(mktemp -t ccsight.XXXXXX)
 trap 'rm -f "$TMP"' EXIT
@@ -118,5 +152,5 @@ python3 "$ENCODER" "$PNG" "$WIDTH" "$COLORS" > "$TMP"
 } > "$PTS"
 
 if [[ "$QUIET" -eq 0 ]]; then
-  echo "ccsight: sent $(wc -c <"$TMP") bytes of sixel to $PTS"
+  echo "ccsight: sent $(wc -c <"$TMP") bytes to $PTS (width=${WIDTH}px, padding=${PADDING} rows)"
 fi
