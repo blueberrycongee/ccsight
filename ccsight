@@ -66,9 +66,17 @@ OPTIONS
   --pts     DEV   override target pty. Bypasses auto-detection.
   --no-cache      skip the encoded-payload cache (~/.cache/ccsight)
   --quiet         do not print the post-render hint
+  --labels CSV    label string per image, comma-separated. Each label is
+                  written above its corresponding image as `[ label ]`.
+                  Useful for stacked comparisons (`ccsight a.png b.png
+                  --labels before,after`).
   --help, -h      this help
 
 SUBCOMMANDS
+  diff <a> <b> [c ...]
+                  shorthand for "two-or-more images stacked with default
+                  labels (before, after, c, d, …)". For custom labels
+                  pass --labels directly to the main command instead.
   calibrate       send a CSI 14 t probe to detect cell_h, save the result
                   to ~/.config/ccsight/config. Inside an agentic CLI this
                   may pollute the wrapper's input parser if its stdin
@@ -208,6 +216,27 @@ resolve_cell_h() {
 }
 
 # ----------------------------------------------------------------------------
+# diff subcommand — re-execs the main flow with default labels prefilled.
+# ----------------------------------------------------------------------------
+if [[ "${1:-}" == "diff" ]]; then
+  shift
+  if (( $# < 2 )); then
+    echo "ccsight diff: needs at least 2 image paths (got $#)" >&2
+    exit 2
+  fi
+  defaults=(before after c d e f g h i j k l)
+  labels_csv=""
+  for ((i=0; i < $#; i++)); do
+    [[ -n "$labels_csv" ]] && labels_csv+=","
+    labels_csv+="${defaults[$i]:-image$((i+1))}"
+  done
+  # We need to know which arg is the script path for re-exec. SELF is set
+  # later in the main flow; resolve it here too.
+  self=$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")
+  exec "$self" --labels "$labels_csv" "$@"
+fi
+
+# ----------------------------------------------------------------------------
 # Calibrate subcommand
 # ----------------------------------------------------------------------------
 if [[ "${1:-}" == "calibrate" ]]; then
@@ -298,6 +327,7 @@ CELL_H_OVERRIDE=""   # empty = run resolve_cell_h
 MAX_H_PX=""          # empty = auto = term_rows × cell_h. 0 disables.
 PROTOCOL=""          # empty = auto-detect from TERM_PROGRAM
 NO_CACHE=0
+LABELS_CSV=""
 
 while (($#)); do
   case $1 in
@@ -310,11 +340,17 @@ while (($#)); do
     --pts)      PTS=$2;              shift 2;;
     --no-cache) NO_CACHE=1;          shift;;
     --quiet)    QUIET=1;             shift;;
+    --labels)   LABELS_CSV=$2;       shift 2;;
     --help|-h)  usage; exit 0;;
     -*)         echo "ccsight: unknown flag: $1" >&2; exit 2;;
     *)          PNGS+=("$1");        shift;;
   esac
 done
+
+declare -a LABELS=()
+if [[ -n "$LABELS_CSV" ]]; then
+  IFS=',' read -ra LABELS <<< "$LABELS_CSV"
+fi
 
 # Resolve protocol. CCSIGHT_PROTOCOL env can override; --protocol flag wins.
 [[ -z "$PROTOCOL" ]] && PROTOCOL=${CCSIGHT_PROTOCOL:-}
@@ -548,8 +584,11 @@ fi
 # tool result" row between each call, repainting onto the just-rendered
 # image and corrupting it. Stacking inside one write avoids that.
 {
-  for payload in "${PAYLOAD_FILES[@]}"; do
-    cat "$payload"
+  for i in "${!PAYLOAD_FILES[@]}"; do
+    if [[ -n "${LABELS[$i]:-}" ]]; then
+      printf '\n[ %s ]\n' "${LABELS[$i]}"
+    fi
+    cat "${PAYLOAD_FILES[$i]}"
   done
   printf '%.0s\n' $(seq 1 "$PADDING")
   if [[ "$QUIET" -eq 0 ]]; then
