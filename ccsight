@@ -54,11 +54,14 @@ OPTIONS
                   always fits in one viewport / one PageUp shows it all.
                   Pass 0 to disable (image renders at native size; very
                   tall images then need multiple scrolls).
-  --protocol P    image protocol. P ∈ {auto, sixel, iterm2}.
-                  Default: auto (TERM_PROGRAM = iTerm.app/WezTerm/ghostty
-                  → iterm2; otherwise sixel).
-                  iterm2 is faster (skips quantize) and supports more
-                  colors, but only works on iTerm2/WezTerm/Ghostty.
+  --protocol P    image protocol. P ∈ {auto, sixel, iterm2, kitty}.
+                  Default: auto. Detection order:
+                    KITTY_WINDOW_ID / TERM=xterm-kitty → kitty
+                    TERM_PROGRAM = iTerm.app/WezTerm/ghostty → iterm2
+                    LC_TERMINAL = iTerm2                    → iterm2
+                    fallback                                 → sixel
+                  iterm2/kitty are faster (skip quantize) and full
+                  color, but each only works on its native terminal.
   --pts     DEV   override target pty. Bypasses auto-detection.
   --quiet         do not print the post-render hint
   --help, -h      this help
@@ -146,9 +149,13 @@ probe_cell_h_via_dsr() {
 
 # Pick an image protocol based on the host terminal. iTerm2-family
 # terminals advertise themselves via TERM_PROGRAM (iTerm2 sets
-# "iTerm.app", WezTerm "WezTerm", Ghostty "ghostty"). Returns the
-# protocol name to stdout.
+# "iTerm.app", WezTerm "WezTerm", Ghostty "ghostty"). Kitty exports
+# KITTY_WINDOW_ID and sets TERM=xterm-kitty. Returns the protocol
+# name to stdout.
 detect_protocol() {
+  if [[ -n "${KITTY_WINDOW_ID:-}" ]] || [[ "${TERM:-}" == "xterm-kitty" ]]; then
+    echo kitty; return
+  fi
   case "${TERM_PROGRAM:-}" in
     iTerm.app|iTerm2.app)  echo iterm2; return;;
     WezTerm)               echo iterm2; return;;
@@ -309,8 +316,8 @@ done
 [[ -z "$PROTOCOL" ]] && PROTOCOL=${CCSIGHT_PROTOCOL:-}
 [[ -z "$PROTOCOL" || "$PROTOCOL" == "auto" ]] && PROTOCOL=$(detect_protocol)
 case "$PROTOCOL" in
-  sixel|iterm2) ;;
-  *) echo "ccsight: unknown protocol '$PROTOCOL' (expected: auto, sixel, iterm2)" >&2; exit 2;;
+  sixel|iterm2|kitty) ;;
+  *) echo "ccsight: unknown protocol '$PROTOCOL' (expected: auto, sixel, iterm2, kitty)" >&2; exit 2;;
 esac
 
 (( ${#PNGS[@]} == 0 )) && { usage >&2; exit 2; }
@@ -416,6 +423,43 @@ for img in "${PNGS[@]}"; do
       } > "$payload"
       # Encoder-style metadata so the rest of the script reads HEIGHT
       # the same way regardless of protocol.
+      printf 'WIDTH=%s\nHEIGHT=%s\n' "$disp_w" "$disp_h" >> "$meta"
+      ;;
+    kitty)
+      python3 "$META_SCRIPT" "$img" "$WIDTH" "$MAX_H_PX" > "$meta"
+      disp_w=""
+      disp_h=""
+      while IFS='=' read -r k v; do
+        [[ "$k" == WIDTH  ]] && disp_w=$v
+        [[ "$k" == HEIGHT ]] && disp_h=$v
+      done < "$meta"
+      cells_w=$(( (${disp_w:-0} + CELL_W_PX - 1) / CELL_W_PX ))
+      cells_h=$(( (${disp_h:-0} + CELL_H_PX - 1) / CELL_H_PX ))
+      (( cells_w < 1 )) && cells_w=1
+      (( cells_h < 1 )) && cells_h=1
+      # Kitty graphics protocol with chunked transfer. Spec:
+      #   \e_G<key=value,...>;<base64>\e\\
+      # First chunk carries the action+format+display sizing; subsequent
+      # chunks only carry m=1 / m=0 (more / last). q=2 silences kitty's
+      # ack response so we don't race the wrapper's stdin read.
+      python3 - "$img" "$cells_w" "$cells_h" >> "$payload" <<'PY'
+import base64, sys
+path, c, r = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+data = base64.b64encode(open(path, 'rb').read()).decode('ascii')
+chunk = 4096
+write = sys.stdout.write
+first = True
+i = 0
+while i < len(data):
+    seg = data[i:i+chunk]
+    i += chunk
+    more = 1 if i < len(data) else 0
+    if first:
+        write(f"\x1b_Ga=T,f=100,c={c},r={r},q=2,m={more};{seg}\x1b\\")
+        first = False
+    else:
+        write(f"\x1b_Gm={more};{seg}\x1b\\")
+PY
       printf 'WIDTH=%s\nHEIGHT=%s\n' "$disp_w" "$disp_h" >> "$meta"
       ;;
   esac
