@@ -21,7 +21,12 @@ usage() {
 ccsight — inline image rendering for agentic CLI terminals (Claude Code, etc.)
 
 USAGE
-  ccsight <image.png> [options]
+  ccsight <image.png> [more.png ...] [options]
+
+  Multiple paths stack vertically with a single trailing padding sized to
+  the combined stack height. Stacking happens INSIDE one subprocess so
+  the wrapping CLI can't paint a tool-result line in between (which would
+  corrupt the upper images).
 
 OPTIONS
   --width    N    target image width in pixels
@@ -35,6 +40,11 @@ OPTIONS
                   Default: 16 (typical xterm 14..18 px). On HiDPI / large
                   fonts this is too small and over-pads; pass --cell-h 24
                   or so to tighten.
+  --max-h    N    cap each image's rendered height in pixels.
+                  Default: terminal_rows × cell_h, so a single image
+                  always fits in one viewport / one PageUp shows it all.
+                  Pass 0 to disable (image renders at native size; very
+                  tall images then need multiple scrolls).
   --pts     DEV   override target pty. Bypasses auto-detection.
   --quiet         do not print the post-render hint
   --help, -h      this help
@@ -54,13 +64,14 @@ EOF
 }
 
 # --- arg parse ---
-PNG=""
+PNGS=()
 WIDTH=""             # empty = auto-size from terminal cols
 COLORS=128
 PADDING=""           # empty = auto-size from image_height / cell_h
 PTS=""
 QUIET=0
 CELL_H_PX=${CCSIGHT_CELL_H:-16}
+MAX_H_PX=""          # empty = auto = term_rows × cell_h. 0 disables.
 
 while (($#)); do
   case $1 in
@@ -68,23 +79,19 @@ while (($#)); do
     --colors)   COLORS=$2;      shift 2;;
     --padding)  PADDING=$2;     shift 2;;
     --cell-h)   CELL_H_PX=$2;   shift 2;;
+    --max-h)    MAX_H_PX=$2;    shift 2;;
     --pts)      PTS=$2;         shift 2;;
     --quiet)    QUIET=1;        shift;;
     --help|-h)  usage; exit 0;;
     -*)         echo "ccsight: unknown flag: $1" >&2; exit 2;;
-    *)
-      if [[ -z "$PNG" ]]; then
-        PNG=$1
-      else
-        echo "ccsight: unexpected argument: $1" >&2
-        exit 2
-      fi
-      shift;;
+    *)          PNGS+=("$1");   shift;;
   esac
 done
 
-[[ -z "$PNG" ]] && { usage >&2; exit 2; }
-[[ ! -f "$PNG" ]] && { echo "ccsight: not a file: $PNG" >&2; exit 1; }
+(( ${#PNGS[@]} == 0 )) && { usage >&2; exit 2; }
+for p in "${PNGS[@]}"; do
+  [[ -f "$p" ]] || { echo "ccsight: not a file: $p" >&2; exit 1; }
+done
 
 # --- locate the encoder relative to this script (resolve symlinks) ---
 SELF=$(readlink -f "$0" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0")
@@ -144,32 +151,47 @@ if [[ -z "$WIDTH" ]]; then
   WIDTH=$(( term_cols * CELL_W_PX ))
 fi
 
-# --- encode ---
+# Default per-image vertical fit: one viewport tall. A single image then
+# always fits in one PageUp's worth of scrollback. Disable with --max-h 0.
+if [[ -z "$MAX_H_PX" ]]; then
+  MAX_H_PX=$(( term_rows * CELL_H_PX ))
+fi
+
+# --- encode each image ---
 # The encoder writes "WIDTH=...\nHEIGHT=..." to stderr after the resize +
-# quantize so we can size padding to the actual rendered image, not to a
-# worst-case constant. stdout still carries the sixel bytes.
-TMP=$(mktemp -t ccsight.XXXXXX)
-META=$(mktemp -t ccsight-meta.XXXXXX)
-trap 'rm -f "$TMP" "$META"' EXIT
+# quantize so we can size padding to the actual rendered total height,
+# not to a worst-case constant.
+WORK=$(mktemp -d -t ccsight.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
 
-python3 "$ENCODER" "$PNG" "$WIDTH" "$COLORS" > "$TMP" 2> "$META"
+declare -i TOTAL_H_PX=0
+declare -a SIXEL_FILES=()
+declare -a HEIGHTS=()
 
-img_height_px=""
-while IFS='=' read -r key value; do
-  case $key in
-    HEIGHT) img_height_px=$value;;
-  esac
-done < "$META"
+for png in "${PNGS[@]}"; do
+  idx=${#SIXEL_FILES[@]}
+  sixel="$WORK/$idx.sixel"
+  meta="$WORK/$idx.meta"
+  python3 "$ENCODER" "$png" "$WIDTH" "$COLORS" "$MAX_H_PX" > "$sixel" 2> "$meta"
+  h=""
+  while IFS='=' read -r key value; do
+    [[ "$key" == "HEIGHT" ]] && h=$value
+  done < "$meta"
+  if [[ "$h" =~ ^[0-9]+$ ]]; then
+    TOTAL_H_PX=$(( TOTAL_H_PX + h ))
+  fi
+  HEIGHTS+=("${h:-?}")
+  SIXEL_FILES+=("$sixel")
+done
 
-# --- auto-pad based on actual image rows ---
-# Padding goal: push the image just past the viewport top, into scrollback.
-# Minimum safe padding ≈ image height (in rows) + small margin for cursor
-# offset. We don't know the wrapper's cursor row at render time, so margin
-# absorbs the slack. Cap at term_rows so we never overshoot a full page —
-# image already in scrollback after term_rows of scroll regardless.
+# --- auto-pad based on combined stack height ---
+# Padding goal: push the entire stack just past the viewport top, into
+# scrollback. The wrapper repaints inside the viewport via absolute cursor
+# positioning; only scrollback is safe. Capped at term_rows because that's
+# the most a single screenful can scroll regardless of stack size.
 if [[ -z "$PADDING" ]]; then
-  if [[ "$img_height_px" =~ ^[0-9]+$ ]] && (( CELL_H_PX > 0 )); then
-    img_rows=$(( (img_height_px + CELL_H_PX - 1) / CELL_H_PX ))   # ceil
+  if (( TOTAL_H_PX > 0 )) && (( CELL_H_PX > 0 )); then
+    img_rows=$(( (TOTAL_H_PX + CELL_H_PX - 1) / CELL_H_PX ))   # ceil
     PADDING=$(( img_rows + 4 ))
     (( PADDING > term_rows )) && PADDING=$term_rows
     (( PADDING < 4 ))         && PADDING=4
@@ -178,15 +200,26 @@ if [[ -z "$PADDING" ]]; then
   fi
 fi
 
-# --- inject ---
+# --- inject all images + final padding in one shot ---
+# Critical: this happens inside ONE subprocess. If the caller chained
+# multiple ccsight calls instead, the wrapping CLI would render a "Bash
+# tool result" row between each call, repainting onto the just-rendered
+# image and corrupting it. Stacking inside one write avoids that.
 {
-  cat "$TMP"
+  for sixel in "${SIXEL_FILES[@]}"; do
+    cat "$sixel"
+  done
   printf '%.0s\n' $(seq 1 "$PADDING")
   if [[ "$QUIET" -eq 0 ]]; then
-    printf '[ccsight: image above — scroll up to view a clean copy]\n'
+    printf '[ccsight: %d image(s) above — scroll up to view]\n' "${#PNGS[@]}"
   fi
 } > "$PTS"
 
 if [[ "$QUIET" -eq 0 ]]; then
-  echo "ccsight: sent $(wc -c <"$TMP") bytes to $PTS (width=${WIDTH}px, height≈${img_height_px:-?}px, padding=${PADDING} rows)"
+  total_bytes=0
+  for sixel in "${SIXEL_FILES[@]}"; do
+    total_bytes=$(( total_bytes + $(wc -c < "$sixel") ))
+  done
+  heights_csv=$(IFS=,; echo "${HEIGHTS[*]}")
+  echo "ccsight: ${#PNGS[@]} image(s), $total_bytes bytes to $PTS (heights=${heights_csv}px, padding=${PADDING} rows)"
 fi

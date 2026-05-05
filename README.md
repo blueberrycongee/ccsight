@@ -53,9 +53,11 @@ printf '\eP0;0;0q#0;2;100;0;0#0!10~-\e\\\n'
 ## Usage
 
 ```
-ccsight <image.png>                    # inline render — width and padding auto-fit
-ccsight foo.png --width 800            # smaller
+ccsight <image.png>                    # inline render — width, height, padding auto-fit
+ccsight a.png b.png c.png              # stack multiple images, single trailing pad
+ccsight foo.png --width 800            # narrower
 ccsight foo.png --colors 64            # tighter palette, smaller payload
+ccsight foo.png --max-h 0              # don't cap height — render at native, scroll
 ccsight foo.png --padding 200          # push deeper into scrollback
 ccsight foo.png --cell-h 24            # see "Calibration" — sets padding tightness
 ccsight foo.png --pts /dev/pts/3       # explicit target if auto-detect misses
@@ -65,6 +67,28 @@ ccsight foo.png --quiet                # skip the trailing hint line
 After running, **scroll up** in your terminal — the clean image is sitting
 in the scrollback. Your agentic CLI's UI may briefly look weird (input
 prompt pushed off-screen). Press any key, the wrapper redraws, normal again.
+
+### Multi-image stacks
+
+Passing several paths in one invocation stacks them vertically and pads
+once at the end:
+
+```bash
+ccsight before.png after.png diff.png
+# → 3 image(s), 412k bytes ... padding=37 rows
+```
+
+Stacking happens INSIDE one subprocess. Chaining ccsight calls instead
+(`ccsight a.png; ccsight b.png`) doesn't work — the wrapping CLI paints
+its "Bash tool result" row in between, repainting onto the first image.
+One invocation, one paint cycle, one clean stack.
+
+### Single-image vertical fit
+
+By default each image is capped at `terminal_rows × cell_h` pixels tall —
+guaranteed to fit in one viewport, so one PageUp shows the whole thing.
+Pass `--max-h 0` to render at native size and accept multiple scrolls
+for very tall screenshots.
 
 ## Calibration: how much to scroll back
 
