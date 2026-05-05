@@ -97,33 +97,44 @@ terminal's actual cell height (pixels per character row). The conversion
 matters because the same 800 px image is "50 rows" on a 16 px font and
 "30 rows" on a 26 px font — different padding requirements.
 
-### Recommended: run `ccsight calibrate` once
+### One-time setup: run `ccsight calibrate` in a bare shell
 
 ```bash
+# In a fresh terminal, NOT inside Claude Code / Cursor / Aider:
 ccsight calibrate
 # → ccsight: detected cell_h = 26px (saved to ~/.config/ccsight/config)
 ```
 
-`calibrate` sends `CSI 14 t` (window pixel size) to your terminal,
-divides the response by `stty rows`, and caches the result. Every
-subsequent ccsight invocation reads the cached value — zero overhead,
-correct sizing.
+`calibrate` sends `CSI 14 t` (window pixel size), reads the response on
+the same pty, divides height by `stty rows`, and caches the result.
+Once cached, every ccsight invocation (including those wrapped inside
+an agentic CLI) reads the cached value — zero overhead, correct sizing.
 
-If your terminal doesn't respond (rare for xterm; common for
-non-xterm-compatibles), or the wrapping CLI snatches the response,
-calibrate prints a fallback hint to set `CCSIGHT_CELL_H` manually.
+### Why bare shell
 
-**Inside an agentic CLI**: calibrate may need retrying if the wrapper
-is actively reading from stdin. If it fails the first time, try once
-more (`ccsight calibrate`); the response usually arrives between the
-wrapper's read polls. For best results, run it from a bare shell once
-before starting your wrapped session.
+The DSR probe response goes to whoever calls `read()` first on the pty.
+Inside an agentic CLI the wrapper is ALSO blocked on `read()` for your
+keystrokes, so the response often lands in the wrapper's input parser
+instead — which has been observed to:
+
+- Print stray characters (`[4;928;1224t`) into the input box.
+- Leave the wrapper's input handler in a state where Enter no longer
+  submits.
+
+To prevent this, ccsight refuses to probe inside a wrapper unless you
+pass `--force`. The main rendering flow (`ccsight foo.png`) **never
+probes** — it only reads the cache. So users who haven't calibrated
+yet just get the safe default of `cell_h=16` and slightly over-padded
+images, never a broken terminal.
 
 ### Resolution priority
 
 ```
---cell-h flag   →   $CCSIGHT_CELL_H   →   ~/.config/ccsight/config   →   DSR probe   →   16 (last resort)
+--cell-h flag   →   $CCSIGHT_CELL_H   →   ~/.config/ccsight/config   →   16 (last resort)
 ```
+
+(No automatic probe in this chain — it's strictly opt-in via
+`ccsight calibrate`.)
 
 ### Manual override
 

@@ -41,12 +41,11 @@ OPTIONS
                    capped to terminal rows; smaller images get less push,
                    so less PageUp to find them)
   --cell-h   N    cell height in pixels for the auto-padding calculation.
-                  Default resolution order:
+                  Default resolution order (NEVER probes automatically):
                     --cell-h flag → $CCSIGHT_CELL_H → ~/.config/ccsight/config
-                    → DSR probe (CSI 14 t against the target pty)
                     → 16 (last-resort fallback)
-                  When the DSR probe succeeds, the result is cached to
-                  the config file so subsequent runs are zero-overhead.
+                  Run `ccsight calibrate` once to populate the config so
+                  subsequent runs use the right value automatically.
   --max-h    N    cap each image's rendered height in pixels.
                   Default: terminal_rows × cell_h, so a single image
                   always fits in one viewport / one PageUp shows it all.
@@ -54,15 +53,15 @@ OPTIONS
                   tall images then need multiple scrolls).
   --pts     DEV   override target pty. Bypasses auto-detection.
   --quiet         do not print the post-render hint
-  --no-probe      skip the DSR auto-detect step (useful if you suspect
-                  it's stealing keystrokes from your wrapper)
   --help, -h      this help
 
 SUBCOMMANDS
-  calibrate       force a fresh DSR probe against the current terminal,
-                  print the detected cell_h, and save it to
-                  ~/.config/ccsight/config. Run this once after changing
-                  font size, monitor DPI, or terminal program.
+  calibrate       send a CSI 14 t probe to detect cell_h, save the result
+                  to ~/.config/ccsight/config. Inside an agentic CLI this
+                  may pollute the wrapper's input parser if its stdin
+                  read wins the race; pass --force to acknowledge that
+                  risk, or run this in a bare shell (recommended). Run
+                  once after changing font size, DPI, or terminal program.
 
 ENVIRONMENT
   CCSIGHT_PTS     fallback pty path if auto-detection fails
@@ -153,23 +152,23 @@ write_config_value() {
   printf '%s=%s\n' "$key" "$value" >> "$CONFIG_FILE"
 }
 
-# Resolve cell_h via the documented priority chain. Caches DSR probe
-# results to the config file on first success.
+# Resolve cell_h via the documented priority chain.
+#
+# WHY NO AUTO-PROBE HERE: the DSR probe (CSI 14 t) sends bytes to the pty
+# expecting a response on the same pty. If the wrapper's stdin read wins
+# the race, those response bytes (e.g. "\e[4;928;1224t") get fed into
+# the wrapper's input parser as if the user typed them — which has been
+# observed to corrupt the wrapper's input state (Enter no longer
+# submits, etc). The probe ONLY runs in `ccsight calibrate` where the
+# user explicitly opted in. Main flow trusts the cache or falls back
+# to a safe default.
 resolve_cell_h() {
-  local override=$1 pts=$2 do_probe=$3
+  local override=$1
   if [[ -n "$override" ]]; then echo "$override"; return; fi
   if [[ -n "${CCSIGHT_CELL_H:-}" ]]; then echo "$CCSIGHT_CELL_H"; return; fi
   local cached
   cached=$(read_config_value cell_h 2>/dev/null || true)
   if [[ "$cached" =~ ^[0-9]+$ ]] && (( cached > 0 )); then echo "$cached"; return; fi
-  if (( do_probe )); then
-    local probed
-    if probed=$(probe_cell_h_via_dsr "$pts") && (( probed > 0 )); then
-      write_config_value cell_h "$probed"
-      echo "$probed"
-      return
-    fi
-  fi
   echo 16
 }
 
@@ -179,9 +178,11 @@ resolve_cell_h() {
 if [[ "${1:-}" == "calibrate" ]]; then
   shift
   pts_arg=""
+  force=0
   while (($#)); do
     case $1 in
       --pts)     pts_arg=$2; shift 2;;
+      --force)   force=1;    shift;;
       --help|-h) usage; exit 0;;
       *)         echo "ccsight calibrate: unexpected arg: $1" >&2; exit 2;;
     esac
@@ -191,6 +192,42 @@ if [[ "${1:-}" == "calibrate" ]]; then
     exit 1
   }
   [[ ! -w "$pts" ]] && { echo "ccsight calibrate: cannot write to $pts" >&2; exit 1; }
+
+  # Detect whether we're inside an agentic CLI session. If so, the probe
+  # response may land in the wrapper's input stream instead of our read,
+  # corrupting its parser state. Refuse without --force.
+  wrapped=""
+  pid=$$
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    parent=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
+    [[ -z "$parent" || "$parent" -le 1 ]] && break
+    cmd=$(ps -p "$parent" -o comm= 2>/dev/null | tr -d ' ' || true)
+    if [[ "$cmd" == claude* || "$cmd" == cursor* || "$cmd" == aider* ]]; then
+      wrapped=$cmd
+      break
+    fi
+    pid=$parent
+  done
+  if [[ -n "$wrapped" ]] && (( ! force )); then
+    cat >&2 <<EOF
+ccsight calibrate: detected wrapping agentic CLI ($wrapped).
+
+The DSR probe writes \e[14t to your pty and reads the response. If the
+wrapper's stdin read wins that race, the response bytes get parsed as
+your keystrokes — observed symptoms include "Enter no longer submits"
+and stray characters in the input box. Bad UX.
+
+Recommended: open a bare shell (a fresh xterm with no $wrapped running),
+ssh to this host if remote, then run \`ccsight calibrate\` there. The
+config is shared, so the cached value carries back to your wrapped
+session automatically.
+
+If you accept the risk and want to try anyway:
+  ccsight calibrate --force
+EOF
+    exit 1
+  fi
+
   if probed=$(probe_cell_h_via_dsr "$pts") && (( probed > 0 )); then
     write_config_value cell_h "$probed"
     echo "ccsight: detected cell_h = ${probed}px (saved to $CONFIG_FILE)"
@@ -201,8 +238,7 @@ ccsight calibrate: terminal didn't respond to CSI 14 t within 500ms.
 
 Possible causes:
   • Your terminal doesn't support window-size DSR (rare for xterm).
-  • Another reader (your wrapping CLI) snatched the response first —
-    try running this in a bare shell, not inside Claude Code / Cursor.
+  • Another reader snatched the response first.
 
 Manual fallback: pick a value (typical 14..30) and pin it via:
   echo 'export CCSIGHT_CELL_H=N' >> ~/.bashrc
@@ -225,7 +261,6 @@ PTS=""
 QUIET=0
 CELL_H_OVERRIDE=""   # empty = run resolve_cell_h
 MAX_H_PX=""          # empty = auto = term_rows × cell_h. 0 disables.
-DO_PROBE=1
 
 while (($#)); do
   case $1 in
@@ -236,7 +271,6 @@ while (($#)); do
     --max-h)    MAX_H_PX=$2;         shift 2;;
     --pts)      PTS=$2;              shift 2;;
     --quiet)    QUIET=1;             shift;;
-    --no-probe) DO_PROBE=0;          shift;;
     --help|-h)  usage; exit 0;;
     -*)         echo "ccsight: unknown flag: $1" >&2; exit 2;;
     *)          PNGS+=("$1");        shift;;
@@ -282,8 +316,8 @@ if [[ -z "$WIDTH" ]]; then
   WIDTH=$(( term_cols * CELL_W_PX ))
 fi
 
-# --- resolve cell_h (flag > env > config > DSR probe > 16) ---
-CELL_H_PX=$(resolve_cell_h "$CELL_H_OVERRIDE" "$PTS" "$DO_PROBE")
+# --- resolve cell_h (flag > env > config > 16; no auto-probe in main flow) ---
+CELL_H_PX=$(resolve_cell_h "$CELL_H_OVERRIDE")
 
 # --- per-image vertical fit ---
 # Default: each image capped at one viewport tall (term_rows × cell_h) so a
