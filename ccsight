@@ -16,12 +16,16 @@
 # wrapper never targets, so anything that wants to survive must live there.
 set -euo pipefail
 
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ccsight"
+CONFIG_FILE="$CONFIG_DIR/config"
+
 usage() {
   cat <<'EOF'
 ccsight — inline image rendering for agentic CLI terminals (Claude Code, etc.)
 
 USAGE
   ccsight <image.png> [more.png ...] [options]
+  ccsight calibrate
 
   Multiple paths stack vertically with a single trailing padding sized to
   the combined stack height. Stacking happens INSIDE one subprocess so
@@ -37,9 +41,12 @@ OPTIONS
                    capped to terminal rows; smaller images get less push,
                    so less PageUp to find them)
   --cell-h   N    cell height in pixels for the auto-padding calculation.
-                  Default: 16 (typical xterm 14..18 px). On HiDPI / large
-                  fonts this is too small and over-pads; pass --cell-h 24
-                  or so to tighten.
+                  Default resolution order:
+                    --cell-h flag → $CCSIGHT_CELL_H → ~/.config/ccsight/config
+                    → DSR probe (CSI 14 t against the target pty)
+                    → 16 (last-resort fallback)
+                  When the DSR probe succeeds, the result is cached to
+                  the config file so subsequent runs are zero-overhead.
   --max-h    N    cap each image's rendered height in pixels.
                   Default: terminal_rows × cell_h, so a single image
                   always fits in one viewport / one PageUp shows it all.
@@ -47,11 +54,19 @@ OPTIONS
                   tall images then need multiple scrolls).
   --pts     DEV   override target pty. Bypasses auto-detection.
   --quiet         do not print the post-render hint
+  --no-probe      skip the DSR auto-detect step (useful if you suspect
+                  it's stealing keystrokes from your wrapper)
   --help, -h      this help
+
+SUBCOMMANDS
+  calibrate       force a fresh DSR probe against the current terminal,
+                  print the detected cell_h, and save it to
+                  ~/.config/ccsight/config. Run this once after changing
+                  font size, monitor DPI, or terminal program.
 
 ENVIRONMENT
   CCSIGHT_PTS     fallback pty path if auto-detection fails
-  CCSIGHT_CELL_H  default cell height for auto-padding
+  CCSIGHT_CELL_H  default cell height for auto-padding (overrides config)
 
 REQUIREMENTS
   • python3 with Pillow (PIL)
@@ -63,6 +78,144 @@ EXIT CODES
 EOF
 }
 
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+
+# Walk parent process tree looking for the wrapping agentic CLI's pty.
+detect_pts() {
+  local pid=$$
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    local parent
+    parent=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
+    [[ -z "$parent" || "$parent" -le 1 ]] && break
+    local cmd tty
+    cmd=$(ps -p "$parent" -o comm= 2>/dev/null | tr -d ' ' || true)
+    tty=$(ps -p "$parent" -o tty= 2>/dev/null | tr -d ' ' || true)
+    if [[ "$cmd" == claude* || "$cmd" == cursor* || "$cmd" == aider* ]] \
+       && [[ -n "$tty" && "$tty" != "?" ]]; then
+      echo "/dev/$tty"
+      return 0
+    fi
+    pid=$parent
+  done
+  return 1
+}
+
+# Resolve target pts via priority chain. Echoes the path on success.
+resolve_pts() {
+  local explicit=$1
+  if [[ -n "$explicit" ]]; then echo "$explicit"; return 0; fi
+  if [[ -n "${CCSIGHT_PTS:-}" ]]; then echo "$CCSIGHT_PTS"; return 0; fi
+  if { : > /dev/tty; } 2>/dev/null; then echo "/dev/tty"; return 0; fi
+  detect_pts
+}
+
+# Probe the terminal's pixel size via CSI 14 t. Computes cell_h by
+# dividing window pixel height by stty rows. Echoes "<cell_h>" on
+# success. Reads the response from the same pty we wrote the query
+# to — works because we're the same UID, and modern xterm responds
+# fast enough that the wrapper's input-read rarely beats us.
+probe_cell_h_via_dsr() {
+  local pts=$1
+  local resp=""
+  exec 9<>"$pts" 2>/dev/null || return 1
+  printf '\e[14t' >&9
+  IFS= read -t 0.5 -d 't' -s -r resp <&9 || { exec 9<&-; exec 9>&-; return 1; }
+  exec 9<&-
+  exec 9>&-
+  # Expect ESC [ 4 ; <H> ; <W>
+  if [[ "$resp" =~ \[4\;([0-9]+)\;([0-9]+)$ ]]; then
+    local px_h=${BASH_REMATCH[1]}
+    local rows
+    rows=$(stty size < "$pts" 2>/dev/null | awk '{print $1}')
+    if [[ "$rows" =~ ^[0-9]+$ ]] && (( rows > 0 )) && (( px_h > 0 )); then
+      echo $(( px_h / rows ))
+      return 0
+    fi
+  fi
+  return 1
+}
+
+read_config_value() {
+  local key=$1
+  [[ -f "$CONFIG_FILE" ]] || return 1
+  awk -F= -v k="$key" '$1==k {print $2; exit}' "$CONFIG_FILE"
+}
+
+write_config_value() {
+  local key=$1 value=$2
+  mkdir -p "$CONFIG_DIR"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    grep -v "^${key}=" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" || true
+    mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  fi
+  printf '%s=%s\n' "$key" "$value" >> "$CONFIG_FILE"
+}
+
+# Resolve cell_h via the documented priority chain. Caches DSR probe
+# results to the config file on first success.
+resolve_cell_h() {
+  local override=$1 pts=$2 do_probe=$3
+  if [[ -n "$override" ]]; then echo "$override"; return; fi
+  if [[ -n "${CCSIGHT_CELL_H:-}" ]]; then echo "$CCSIGHT_CELL_H"; return; fi
+  local cached
+  cached=$(read_config_value cell_h 2>/dev/null || true)
+  if [[ "$cached" =~ ^[0-9]+$ ]] && (( cached > 0 )); then echo "$cached"; return; fi
+  if (( do_probe )); then
+    local probed
+    if probed=$(probe_cell_h_via_dsr "$pts") && (( probed > 0 )); then
+      write_config_value cell_h "$probed"
+      echo "$probed"
+      return
+    fi
+  fi
+  echo 16
+}
+
+# ----------------------------------------------------------------------------
+# Calibrate subcommand
+# ----------------------------------------------------------------------------
+if [[ "${1:-}" == "calibrate" ]]; then
+  shift
+  pts_arg=""
+  while (($#)); do
+    case $1 in
+      --pts)     pts_arg=$2; shift 2;;
+      --help|-h) usage; exit 0;;
+      *)         echo "ccsight calibrate: unexpected arg: $1" >&2; exit 2;;
+    esac
+  done
+  pts=$(resolve_pts "$pts_arg") || {
+    echo "ccsight calibrate: could not detect target pty" >&2
+    exit 1
+  }
+  [[ ! -w "$pts" ]] && { echo "ccsight calibrate: cannot write to $pts" >&2; exit 1; }
+  if probed=$(probe_cell_h_via_dsr "$pts") && (( probed > 0 )); then
+    write_config_value cell_h "$probed"
+    echo "ccsight: detected cell_h = ${probed}px (saved to $CONFIG_FILE)"
+    exit 0
+  fi
+  cat >&2 <<EOF
+ccsight calibrate: terminal didn't respond to CSI 14 t within 500ms.
+
+Possible causes:
+  • Your terminal doesn't support window-size DSR (rare for xterm).
+  • Another reader (your wrapping CLI) snatched the response first —
+    try running this in a bare shell, not inside Claude Code / Cursor.
+
+Manual fallback: pick a value (typical 14..30) and pin it via:
+  echo 'export CCSIGHT_CELL_H=N' >> ~/.bashrc
+  # or:
+  echo 'cell_h=N' > $CONFIG_FILE
+EOF
+  exit 1
+fi
+
+# ----------------------------------------------------------------------------
+# Main rendering flow
+# ----------------------------------------------------------------------------
+
 # --- arg parse ---
 PNGS=()
 WIDTH=""             # empty = auto-size from terminal cols
@@ -70,21 +223,23 @@ COLORS=128
 PADDING=""           # empty = auto-size from image_height / cell_h
 PTS=""
 QUIET=0
-CELL_H_PX=${CCSIGHT_CELL_H:-16}
+CELL_H_OVERRIDE=""   # empty = run resolve_cell_h
 MAX_H_PX=""          # empty = auto = term_rows × cell_h. 0 disables.
+DO_PROBE=1
 
 while (($#)); do
   case $1 in
-    --width)    WIDTH=$2;       shift 2;;
-    --colors)   COLORS=$2;      shift 2;;
-    --padding)  PADDING=$2;     shift 2;;
-    --cell-h)   CELL_H_PX=$2;   shift 2;;
-    --max-h)    MAX_H_PX=$2;    shift 2;;
-    --pts)      PTS=$2;         shift 2;;
-    --quiet)    QUIET=1;        shift;;
+    --width)    WIDTH=$2;            shift 2;;
+    --colors)   COLORS=$2;           shift 2;;
+    --padding)  PADDING=$2;          shift 2;;
+    --cell-h)   CELL_H_OVERRIDE=$2;  shift 2;;
+    --max-h)    MAX_H_PX=$2;         shift 2;;
+    --pts)      PTS=$2;              shift 2;;
+    --quiet)    QUIET=1;             shift;;
+    --no-probe) DO_PROBE=0;          shift;;
     --help|-h)  usage; exit 0;;
     -*)         echo "ccsight: unknown flag: $1" >&2; exit 2;;
-    *)          PNGS+=("$1");   shift;;
+    *)          PNGS+=("$1");        shift;;
   esac
 done
 
@@ -100,31 +255,7 @@ ENCODER="$DIR/lib/png2sixel.py"
 [[ ! -f "$ENCODER" ]] && { echo "ccsight: encoder missing at $ENCODER" >&2; exit 1; }
 
 # --- choose target pty ---
-# Priority: --pts arg > $CCSIGHT_PTS > /dev/tty > parent-process-tree probe.
-if [[ -z "$PTS" ]]; then
-  PTS=${CCSIGHT_PTS:-}
-fi
-if [[ -z "$PTS" ]]; then
-  if { : > /dev/tty; } 2>/dev/null; then
-    PTS=/dev/tty
-  fi
-fi
-if [[ -z "$PTS" ]]; then
-  pid=$$
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    parent=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ' || true)
-    [[ -z "$parent" || "$parent" -le 1 ]] && break
-    cmd=$(ps -p "$parent" -o comm= 2>/dev/null | tr -d ' ' || true)
-    tty=$(ps -p "$parent" -o tty= 2>/dev/null | tr -d ' ' || true)
-    if [[ "$cmd" == claude* || "$cmd" == cursor* || "$cmd" == aider* ]] \
-       && [[ -n "$tty" && "$tty" != "?" ]]; then
-      PTS="/dev/$tty"
-      break
-    fi
-    pid=$parent
-  done
-fi
-
+PTS=$(resolve_pts "$PTS") || PTS=""
 [[ -z "$PTS" ]] && { echo "ccsight: could not detect a target pty (try --pts /dev/pts/N or set CCSIGHT_PTS)" >&2; exit 1; }
 [[ ! -w "$PTS" ]] && { echo "ccsight: cannot write to $PTS (permissions / wrong session)" >&2; exit 1; }
 
@@ -151,8 +282,13 @@ if [[ -z "$WIDTH" ]]; then
   WIDTH=$(( term_cols * CELL_W_PX ))
 fi
 
-# Default per-image vertical fit: one viewport tall. A single image then
-# always fits in one PageUp's worth of scrollback. Disable with --max-h 0.
+# --- resolve cell_h (flag > env > config > DSR probe > 16) ---
+CELL_H_PX=$(resolve_cell_h "$CELL_H_OVERRIDE" "$PTS" "$DO_PROBE")
+
+# --- per-image vertical fit ---
+# Default: each image capped at one viewport tall (term_rows × cell_h) so a
+# single image always fits in one PageUp's worth of scrollback. --max-h 0
+# disables. --max-h <N> sets explicit pixel cap.
 if [[ -z "$MAX_H_PX" ]]; then
   MAX_H_PX=$(( term_rows * CELL_H_PX ))
 fi
@@ -221,5 +357,5 @@ if [[ "$QUIET" -eq 0 ]]; then
     total_bytes=$(( total_bytes + $(wc -c < "$sixel") ))
   done
   heights_csv=$(IFS=,; echo "${HEIGHTS[*]}")
-  echo "ccsight: ${#PNGS[@]} image(s), $total_bytes bytes to $PTS (heights=${heights_csv}px, padding=${PADDING} rows)"
+  echo "ccsight: ${#PNGS[@]} image(s), $total_bytes bytes to $PTS (cell_h=${CELL_H_PX}px, heights=${heights_csv}px, padding=${PADDING} rows)"
 fi

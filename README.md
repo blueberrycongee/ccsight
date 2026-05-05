@@ -92,38 +92,54 @@ for very tall screenshots.
 
 ## Calibration: how much to scroll back
 
-ccsight auto-sizes padding to match the rendered image's actual height,
-so smaller images don't push you a full screen up. The calculation needs
-to know how tall a single character cell is in pixels — the conversion
-factor between "image pixels emitted" and "terminal rows scrolled."
+ccsight auto-sizes padding and per-image vertical fit to match the
+terminal's actual cell height (pixels per character row). The conversion
+matters because the same 800 px image is "50 rows" on a 16 px font and
+"30 rows" on a 26 px font — different padding requirements.
 
-The default is **16 px / cell**, which matches typical xterm at default
-font size. If your terminal uses a larger font (HiDPI / 12pt monospace
-on a Retina display), each cell is taller — say 24..50 px — and the
-default over-pads. Symptom: you scroll way more than needed to find a
-small image.
-
-To calibrate, eyeball your image once: roughly how many character rows
-does it occupy in the terminal? Then:
-
-```
-cell-h ≈ image_height_px / image_rows_visible
-```
-
-For example, a 680 px image that visually spans ~13 rows → cell-h ≈ 52.
-Pin it via:
+### Recommended: run `ccsight calibrate` once
 
 ```bash
-# one-shot
+ccsight calibrate
+# → ccsight: detected cell_h = 26px (saved to ~/.config/ccsight/config)
+```
+
+`calibrate` sends `CSI 14 t` (window pixel size) to your terminal,
+divides the response by `stty rows`, and caches the result. Every
+subsequent ccsight invocation reads the cached value — zero overhead,
+correct sizing.
+
+If your terminal doesn't respond (rare for xterm; common for
+non-xterm-compatibles), or the wrapping CLI snatches the response,
+calibrate prints a fallback hint to set `CCSIGHT_CELL_H` manually.
+
+**Inside an agentic CLI**: calibrate may need retrying if the wrapper
+is actively reading from stdin. If it fails the first time, try once
+more (`ccsight calibrate`); the response usually arrives between the
+wrapper's read polls. For best results, run it from a bare shell once
+before starting your wrapped session.
+
+### Resolution priority
+
+```
+--cell-h flag   →   $CCSIGHT_CELL_H   →   ~/.config/ccsight/config   →   DSR probe   →   16 (last resort)
+```
+
+### Manual override
+
+When DSR is impossible:
+
+```bash
+# eyeball estimate: render once at default, count rows, divide:
 ccsight foo.png --cell-h 50
 
-# persistent (add to ~/.bashrc / ~/.zshrc)
+# persistent
 export CCSIGHT_CELL_H=50
 ```
 
-When in doubt, leave the default — over-padding is harmless (image is
-deeper in scrollback, but still clean). Under-padding risks the
-wrapper's chat-flow repaint clipping rows of the image, which IS bad.
+Over-padding is harmless (image is deeper in scrollback, still clean).
+Under-padding risks the wrapper's chat-flow repaint clipping rows of
+the image, which IS bad — so when in doubt, lean high.
 
 ## How it actually works
 
